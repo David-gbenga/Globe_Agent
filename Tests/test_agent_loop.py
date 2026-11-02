@@ -39,7 +39,7 @@ def test_tool_call_then_answer():
 
 def test_tool_result_is_fed_back_to_the_model():
     llm = ScriptedLLM([
-        json.dumps({"tool": "whoami", "args": {"user_id": "E024"}}),
+        json.dumps({"tool": "whoami", "args": {}}),
         json.dumps({"answer": "done", "citations": []}),
     ])
     answer(req("who am I?"), llm=llm)

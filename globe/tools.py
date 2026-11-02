@@ -41,17 +41,28 @@ def search_policies(query: str, k: int = 4) -> str:
 # expense data
 # --------------------------------------------------------------------------
 
-def whoami(user_id: str) -> str:
-    """Look up the profile of an employee."""
+DENIED = "ERROR: access denied or resource unavailable."
+
+
+def _visible_employee_ids(conn: sqlite3.Connection, caller_id: str) -> tuple[str, ...]:
+    """Only caller + immediate direct reports; never traverse manager hierarchy."""
+    if not isinstance(caller_id, str) or not caller_id.strip():
+        return ()
+    found = conn.execute("SELECT id FROM employees WHERE id = ?", (caller_id,)).fetchone()
+    if found is None:
+        return ()
+    reports = conn.execute("SELECT id FROM employees WHERE manager_id = ?", (caller_id,))
+    return (caller_id, *(row[0] for row in reports))
+
+
+def whoami(*, caller_id: str) -> str:
+    """Return only the authenticated caller's profile."""
     with _connect() as conn:
         row = conn.execute(
             "SELECT id, name, department, cost_centre, manager_id, status "
-            "FROM employees WHERE id = ?",
-            (user_id,),
+            "FROM employees WHERE id = ?", (caller_id,)
         ).fetchone()
-    if not row:
-        return f"No employee with id {user_id}."
-    return json.dumps(dict(row))
+    return json.dumps(dict(row)) if row else DENIED
 
 
 def get_expense_reports(
@@ -60,47 +71,59 @@ def get_expense_reports(
     status: str | None = None,
     min_amount_gbp: float | None = None,
     limit: int = 20,
+    *,
+    caller_id: str,
 ) -> str:
-    """Look up expense reports."""
-    clauses, params = [], []
-    if report_id:
-        clauses.append("r.id = ?")
-        params.append(report_id)
-    if employee_id:
-        clauses.append("r.employee_id = ?")
-        params.append(employee_id)
-    if status:
-        clauses.append("r.status = ?")
-        params.append(status)
-    if min_amount_gbp is not None:
-        clauses.append("r.total_gbp >= ?")
-        params.append(float(min_amount_gbp))
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = (
-        "SELECT r.id, r.employee_id, e.name AS employee_name, r.title, r.status, "
-        "r.submitted_at, r.total_gbp, r.cost_centre "
-        "FROM expense_reports r JOIN employees e ON e.id = r.employee_id "
-        f"{where} ORDER BY r.submitted_at DESC LIMIT ?"
-    )
-    params.append(int(limit))
+    """Read only self and direct reports, even for unfiltered or report-id queries."""
     with _connect() as conn:
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        visible = _visible_employee_ids(conn, caller_id)
+        if not visible:
+            return DENIED
+        if employee_id is not None and employee_id not in visible:
+            return DENIED
+        slots = ",".join("?" for _ in visible)
+        clauses = [f"r.employee_id IN ({slots})"]
+        params: list[Any] = list(visible)
+        if report_id is not None:
+            clauses.append("r.id = ?")
+            params.append(report_id)
+        if employee_id is not None:
+            clauses.append("r.employee_id = ?")
+            params.append(employee_id)
+        if status is not None:
+            clauses.append("r.status = ?")
+            params.append(status)
+        if min_amount_gbp is not None:
+            clauses.append("r.total_gbp >= ?")
+            params.append(float(min_amount_gbp))
+        safe_limit = max(1, min(int(limit), 100))
+        sql = (
+            "SELECT r.id, r.employee_id, e.name AS employee_name, r.title, r.status, "
+            "r.submitted_at, r.total_gbp, r.cost_centre "
+            "FROM expense_reports r JOIN employees e ON e.id = r.employee_id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY r.submitted_at DESC LIMIT ?"
+        )
+        rows = [dict(row) for row in conn.execute(sql, [*params, safe_limit])]
     return json.dumps(rows, indent=2) if rows else "No matching expense reports."
 
 
-def get_expense_lines(report_id: str) -> str:
-    """List the individual line items on an expense report."""
+def get_expense_lines(report_id: str, *, caller_id: str) -> str:
+    """Authorize report ownership in the same query that retrieves its lines."""
     with _connect() as conn:
-        rows = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT id, report_id, category, description, amount_gbp, "
-                "incurred_on, receipt_missing FROM expense_lines "
-                "WHERE report_id = ? ORDER BY incurred_on",
-                (report_id,),
-            ).fetchall()
-        ]
-    return json.dumps(rows, indent=2) if rows else f"No lines on report {report_id}."
+        visible = _visible_employee_ids(conn, caller_id)
+        if not visible:
+            return DENIED
+        slots = ",".join("?" for _ in visible)
+        rows = [dict(row) for row in conn.execute(
+            "SELECT l.id, l.report_id, l.category, l.description, l.amount_gbp, "
+            "l.incurred_on, l.receipt_missing "
+            "FROM expense_lines l JOIN expense_reports r ON r.id = l.report_id "
+            f"WHERE l.report_id = ? AND r.employee_id IN ({slots}) "
+            "ORDER BY l.incurred_on", (report_id, *visible)
+        )]
+    # Uniform denial/unknown response prevents report-id enumeration.
+    return json.dumps(rows, indent=2) if rows else "No accessible expense lines found."
 
 
 # --------------------------------------------------------------------------
@@ -115,8 +138,8 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "whoami": {
         "fn": whoami,
-        "args": {"user_id": "str"},
-        "description": "Look up an employee profile: department, cost centre, manager.",
+        "args": {},
+        "description": "Look up the authenticated caller profile.",
     },
     "get_expense_reports": {
         "fn": get_expense_reports,
@@ -145,11 +168,22 @@ def spec() -> str:
     return "\n".join(lines)
 
 
-def dispatch(name: str, args: dict[str, Any]) -> str:
+def dispatch(name: str, args: dict[str, Any], *, caller_id: str) -> str:
+    """Trusted caller supplied by the agent, NEVER from model-generated args."""
     tool = TOOLS.get(name)
     if tool is None:
         return f"ERROR: no such tool {name!r}. Available: {', '.join(TOOLS)}"
+    if not isinstance(args, dict):
+        return "ERROR: tool arguments must be an object"
+    if not isinstance(caller_id, str) or not caller_id:
+        return DENIED
+    if "caller_id" in args or "user_id" in args:
+        return DENIED
     try:
-        return tool["fn"](**args)
-    except TypeError as exc:
-        return f"ERROR: bad arguments for {name}: {exc}"
+        if name == "search_policies":
+            return tool["fn"](**args)
+        return tool["fn"](**args, caller_id=caller_id)
+    except (TypeError, ValueError) as exc:
+        return f"ERROR: bad arguments for {name}: {type(exc).__name__}"
+    except sqlite3.Error:
+        return "ERROR: database unavailable"

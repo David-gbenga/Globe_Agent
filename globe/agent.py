@@ -69,7 +69,7 @@ def answer(request: AgentRequest, llm: LLMClient | None = None) -> AgentResponse
         if "tool" in parsed:
             name = parsed["tool"]
             args = parsed.get("args") or {}
-            result = tools.dispatch(name, args)
+            result = tools.dispatch(name, args, caller_id=request.user_id)
             calls.append(ToolCall(name=name, args=args, ok=not result.startswith("ERROR")))
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"TOOL RESULT ({name}):\n{result}"})
