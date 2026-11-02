@@ -16,6 +16,9 @@ import ssl
 import urllib.error
 import urllib.request
 from typing import Protocol
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DEFAULT_MODEL = os.environ.get("GLOBE_MODEL", "gpt-5-nano")
 AZURE_OPENAI_ENDPOINT = os.environ.get(
@@ -60,12 +63,11 @@ def _http_json(
         raise LLMError(str(exc)) from exc
 
 
-def _azure_chat_url(deployment: str) -> str:
+
+def _azure_chat_url() -> str:
     endpoint = AZURE_OPENAI_ENDPOINT.rstrip("/")
-    return (
-        f"{endpoint}/openai/deployments/{deployment}/chat/completions"
-        f"?api-version={AZURE_OPENAI_API_VERSION}"
-    )
+    return f"{endpoint}/openai/v1/chat/completions"
+
 
 
 class AzureOpenAILLM:
@@ -84,25 +86,37 @@ class AzureOpenAILLM:
             )
         self.calls = 0
 
+    
     def complete(self, system: str, messages: list[dict]) -> str:
         self.calls += 1
+
         payload = {
-            "messages": [{"role": "system", "content": system}, *messages],
-            "max_completion_tokens": 4094,
-        }
+        "model": self.deployment,
+        "messages": [
+            {"role": "system", "content": system},
+            *messages,
+        ],
+        "max_completion_tokens": 4094,
+    }
+
         body = _http_json(
-            _azure_chat_url(self.deployment),
-            payload,
-            {
-                "content-type": "application/json",
-                "api-key": self.api_key,
-            },
-        )
+        _azure_chat_url(),
+        payload,
+        {
+            "content-type": "application/json",
+            "api-key": self.api_key,
+        },
+    )
+
         choices = body.get("choices") or []
+
         if not choices:
             return ""
+
         message = choices[0].get("message") or {}
+
         return message.get("content", "") or ""
+
 
 
 class AnthropicLLM:
