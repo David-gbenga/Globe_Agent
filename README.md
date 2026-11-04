@@ -1,99 +1,48 @@
-# Globe — AI Agent
+# Globe — Finance Policy & Expense Agent
 
-Globe is an internal AI assistant for the Finance team. It answers employee questions about travel and expense policy and retrieves expense report data from the company database. It was built as a proof-of-concept by a data scientist in the AI engineering team.
+Globe is a read-only Finance assistant for travel/expense policy Q&A and employee expense reports. It uses BM25 over Markdown, SQLite, JSON-based tool calling and Microsoft Foundry v1 (Azure OpenAI). **Not production-ready.** Grading entry point: `globe.agent.answer(AgentRequest(...)) -> AgentResponse`.
 
-> *"It works, but is not safe to run in a production environment."* — data scientist's handoff note
+## Setup and verification (Windows PowerShell; no `make` required)
 
----
+From the project root, with **Python 3.12** installed:
 
-## Setup
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-make setup                      # installs deps and builds data/expenses.db
-cp .env.example .env            # add credentials (see below)
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python scripts/build_db.py               # Only if data/expenses.db needs creating/rebuilding
+Copy-Item env.example .env              # If .env does not already exist; add your own credentials
 ```
 
-Check it works:
+In `.env`, set `GLOBE_LLM_PROVIDER=azure`, `GLOBE_MODEL` (**Foundry deployment name**), `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY`. Anthropic is also supported (`GLOBE_LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`). Never commit `.env`. `$env:GLOBE_FAKE = '1'` runs canned offline responses for pipeline checks, **not answer quality**.
 
-```bash
-make test                       # 11 pass, 3 xfail (the xfails are the point)
-make run Q="What is the daily meal ceiling in London?"
-make eval                       # writes EVAL_REPORT.md
+```powershell
+python -m pytest -v
+$env:GLOBE_FAKE = '0'                    # Live provider (requires valid .env)
+python cli.py --user E024 "What is the daily meal ceiling in London?"
+python evals/runner.py --repeat 3        # Writes EVAL_REPORT.md; nonzero exit if gate fails
 ```
 
-Everything runs offline with `GLOBE_FAKE=1` (a canned-response fake). Useful for checking the pipeline, useless for judging answer quality.
+The starter `Makefile` remains available (`make setup/test/run/eval`). I used Windows Python commands because GNU Make was unavailable. Rebuilding the DB may overwrite fixture changes.
 
-If you encounter a setup problem that prevents you from starting, contact us rather than spending assessment time troubleshooting the environment.
+## What I changed and the hardest decisions
 
----
+1. **Authorization in code, not prompts.** `request.user_id` is trusted; the dispatcher rejects identity overrides and scoped SQL limits access to self/direct reports, including report lines. I rejected prompt-only permissions. The model should consult the authorized tool before assuming a manager lacks access.
+2. **Retrieval is evidence, not authority.** A deliberately poisoned appendix contains disclosure instructions. Tool output is marked untrusted and citations are checked against retrieved document/section IDs. I rejected obeying retrieved instructions or blindly accepting model citations. **Valid citations do not prove semantic support.**
+3. **Bound execution; measure failures.** The loop caps steps at 12, uses an **estimated** 16,000-token budget and limits tool output, with caveated fallbacks. I kept JSON tool calling and BM25 rather than adopting native function calls, vector search or orchestration infrastructure. I prioritised deterministic assertions and repeated live evaluation.
 
-## LLM provider
+## Evaluation, known failures and production signals
 
-The starter kit includes a minimal HTTP client in `globe/llm.py` with no SDK dependencies. It supports two providers via `GLOBE_LLM_PROVIDER`; you must supply your own credentials:
+The **25 evaluation cases** cover grounding, refusal, authorization, prompt injection and ambiguity. The runner reports category rates and failures without an LLM judge. Latest supplied **live** result (4 November 2026): **71/75 (95% rounded)** across three repeats; grounding **15/15**, refusal **15/15**, ambiguity **15/15**, authorization **14/15**, injection **12/15**. **23/25 cases passed every repetition.** I retained failures. Some appropriate “not trustworthy”/“access is restricted” replies fail narrow string assertions; passing citation IDs also cannot prove semantic support or absence of leakage.
 
-| Provider | `GLOBE_LLM_PROVIDER` | Credentials in `.env` |
-|---|---|---|
-| Azure OpenAI (default) | `azure` | `AZURE_OPENAI_API_KEY` |
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` |
+Remaining weaknesses: pattern-based clarification may miss unseen phrasings; token estimates are not exact usage; provider timeouts do not guarantee an end-to-end deadline. In production I would monitor **redacted** traces, tool decisions, citation IDs, stop reasons, latency, provider usage and denials; alert on leakage signals, citation failures, timeouts and drift; sample failures without logging private expense contents; and add incidents to regression cases.
 
-Set `GLOBE_MODEL` to the deployment or model name for your provider. For Azure, this is the Foundry deployment name (not the underlying model ID).
+## Deliberate scope cuts and AI-assisted development
 
-To use another provider (OpenAI, local models, etc.), implement `LLMClient` in `globe/llm.py` and register it in `get_llm()`. Keep the `complete(system, messages)` signature so tests and the eval harness keep working.
+I intentionally omitted writes, UI, vector storage, semantic entailment verification, exact token accounting and production telemetry: they add integration risk beyond the core safety/evaluation goals. I used **ChatGPT** for code-review ideas, targeted patches, test design and documentation; I inspected changes and used pytest plus live evaluations rather than treating AI output as proof. Total effort was **approximately five hours**, exceeding the suggested three. In hindsight, I should have stopped after the core authorization, injection and evaluation gates rather than polishing edge cases.
 
----
+## Future write path: raising policy exceptions (not implemented)
 
-## What is here
+A policy exception is a **mutation**, requiring a trusted workflow—not arbitrary SQL or a general-purpose write tool exposed to the LLM. A narrow `create_policy_exception` service would accept a typed request containing the expense reference, category, justification and evidence. The agent could draft it, but would display the exact proposed action and require explicit user confirmation. Identity would be taken from the authenticated session, not model arguments; server-side checks would verify report ownership/manager scope, required fields and permission to _request_, not approve, an exception.
 
-```
-globe/
-  interface.py    AgentRequest / AgentResponse — do not change the signatures
-  agent.py        the tool-calling loop
-  tools.py        the tools the model can call
-  retrieval.py    BM25 over docs/ — you should not need to touch this
-  llm.py          LLM clients (Azure, Anthropic) + ScriptedLLM / FakeLLM for tests
-docs/             16 policy documents
-data/expenses.db  employees, expense_reports, expense_lines
-evals/
-  runner.py       the eval harness — extend the assertion registry if needed
-  cases.yaml      5 seed cases; you need 15+
-tests/            example tests, including three that are meant to fail
-scripts/build_db.py   regenerates the database deterministically
-cli.py            ask one question
-```
-
-The grading harness calls exactly one thing:
-
-```python
-from globe.agent import answer
-answer(AgentRequest(user_id="E024", message="...", trace_id="...")) -> AgentResponse
-```
-
-Keep that importable and side-effect-free on import. Everything behind it is yours to restructure.
-
----
-
-## The fixture
-
-The database contains forty employees in a three-level hierarchy. `employees.manager_id` is the authorization relation that matters.
-
-| id | role in the fixture |
-|---|---|
-| `E001` | CFO, no manager, owns a report over £10,000 |
-| `E002` | Engineering head, manages `E012` |
-| `E012` | Engineering lead, manages `E024`, `E030`, `E036` |
-| `E024` | Individual contributor, managed by `E012` |
-| `E004` | Sales head — a different chain, useful for denial tests |
-| `E034` | departed employee with an outstanding claim |
-
-Also present, because real data is not tidy: a duplicated submission, a report with a null cost centre, and line items with missing receipts.
-
----
-
-## Notes on the design
-
-- The agent uses a **JSON protocol** rather than provider-native tool calling, so it stays portable across models and so `ScriptedLLM` can pin behaviour in tests. That part is intentional; keep it or change it, but say which.
-- Retrieval is BM25 over 16 documents. Sixteen documents do not need a vector database, and we are not scoring retrieval.
-- Other implementation details may be changed where you believe this improves the solution; some existing choices are intentionally imperfect.
-
----
+Submission would be transactional and idempotent to prevent duplicates on retries. It would create a **pending** request and an immutable audit entry with actor, timestamp and policy version—never change reimbursement or self-approve. A separate reviewer role would control approval transitions, with segregation of duties and notifications. I would use least-privilege DB credentials, rate limits, session/CSRF protections where relevant, retention controls and redacted logs. Adversarial tests would cover foreign report IDs, prompt injection, duplicate retries, failed writes and concurrent submissions. Alerts would flag unusual mutations, authorization denials and audit gaps. The existing assistant would remain read-only until this workflow was independently reviewed.
